@@ -14,6 +14,11 @@ const envPath = app.isPackaged
   : path.join(__dirname, '..', '.env')
 require('dotenv').config({ path: envPath })
 
+const log = require('electron-log/main')
+log.initialize()
+log.transports.file.level = 'info'
+log.transports.console.level = false  // pas de doublon dans le terminal dev
+
 const isDev = !app.isPackaged
 
 // ─── Fenêtre principale ───────────────────────────────────────────────────────
@@ -44,7 +49,10 @@ function createWindow() {
   }
 }
 
-app.whenReady().then(createWindow)
+app.whenReady().then(() => {
+  log.info(`Backup Cloud Manager démarré — rclone: ${process.env.VITE_RCLONE_PATH || '/usr/local/bin/rclone'}`)
+  createWindow()
+})
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit() })
 app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow() })
 
@@ -112,12 +120,18 @@ function lsjson(rcloneBin, rclonePath) {
       chunks.push(d)
     })
 
+    let stderrOut = ''
+    proc.stderr.on('data', (d) => { stderrOut += d.toString() })
+
     proc.on('close', (code) => {
       if (aborted) return
-      if (code !== 0) { reject(new Error(`lsjson a échoué (code ${code}) sur "${rclonePath}"`)); return }
+      if (code !== 0) {
+        const detail = stderrOut.trim().split('\n').pop() || ''
+        reject(new Error(`lsjson a échoué (code ${code}) sur "${rclonePath}"${detail ? ` : ${detail}` : ''}`))
+        return
+      }
       try {
         const files = JSON.parse(Buffer.concat(chunks).toString())
-        // Retourne un Map : Path → { size, date }
         const map = new Map()
         files.forEach(f => {
           if (!f.IsDir) map.set(f.Path, { size: f.Size, date: new Date(f.ModTime) })
@@ -150,9 +164,16 @@ function processApplyLine(event, line, srcMap) {
 
 let currentProc = null
 
-ipcMain.on('rclone:stop', () => {
-  if (currentProc) currentProc.kill('SIGTERM')
-})
+function killProc(proc) {
+  if (!proc) return
+  proc.kill('SIGTERM')
+  const fallback = setTimeout(() => {
+    try { proc.kill('SIGKILL') } catch {}
+  }, 5000)
+  proc.once('close', () => clearTimeout(fallback))
+}
+
+ipcMain.on('rclone:stop', () => killProc(currentProc))
 
 // ─── IPC : listremotes ────────────────────────────────────────────────────────
 
@@ -181,16 +202,17 @@ ipcMain.handle('dialog:browse', async () => {
 })
 
 // ─── IPC : diff (TEST) ────────────────────────────────────────────────────────
-// Deux lsjson en parallèle → diff en mémoire → émet rclone:file pour chaque absent
 
 ipcMain.on('rclone:diff', async (event, { src, dst }) => {
   if (!isValidRclonePath(src) || !isValidRclonePath(dst)) {
+    log.warn(`diff — chemin invalide: src=${src} dst=${dst}`)
     event.reply('rclone:log', '[ERREUR] Chemin source ou destination invalide.')
     event.reply('rclone:done', { code: 1 })
     return
   }
 
   const rcloneBin = process.env.VITE_RCLONE_PATH || '/usr/local/bin/rclone'
+  log.info(`diff START src=${src} dst=${dst}`)
 
   event.reply('rclone:log', `[INFO] Listing en parallèle…\n  src: ${src}\n  dst: ${dst}`)
 
@@ -198,12 +220,12 @@ ipcMain.on('rclone:diff', async (event, { src, dst }) => {
   try {
     ;[srcMap, dstMap] = await Promise.all([lsjson(rcloneBin, src), lsjson(rcloneBin, dst)])
   } catch (err) {
+    log.error(`diff ERREUR: ${err.message}`)
     event.reply('rclone:log', `[ERREUR] ${err.message}`)
     event.reply('rclone:done', { code: 1 })
     return
   }
 
-  // Diff : fichiers présents dans src mais absents de dst, ou même nom mais taille différente
   const IGNORED = /^(|.*\/).DS_Store$/
   let missing = 0
   for (const [filePath, srcMeta] of srcMap) {
@@ -221,6 +243,8 @@ ipcMain.on('rclone:diff', async (event, { src, dst }) => {
     }
   }
 
+  const msg = `diff END src=${srcMap.size} dst=${dstMap.size} missing=${missing}`
+  log.info(msg)
   event.reply('rclone:log', `[INFO] Diff terminé : ${srcMap.size} fichiers source, ${dstMap.size} destination, ${missing} à copier.`)
   event.reply('rclone:done', { code: 0 })
 })
@@ -228,6 +252,11 @@ ipcMain.on('rclone:diff', async (event, { src, dst }) => {
 // ─── IPC : run (APPLY) ────────────────────────────────────────────────────────
 
 ipcMain.on('rclone:run', async (event, { src, dst, filesList }) => {
+  if (currentProc) {
+    event.reply('rclone:log', '[ERREUR] Une opération est déjà en cours.')
+    event.reply('rclone:done', { code: 1 })
+    return
+  }
   if (!isValidRclonePath(src) || !isValidRclonePath(dst)) {
     event.reply('rclone:log', '[ERREUR] Chemin source ou destination invalide.')
     event.reply('rclone:done', { code: 1 })
@@ -243,7 +272,6 @@ ipcMain.on('rclone:run', async (event, { src, dst, filesList }) => {
 
   const args = ['copy', src, dst, '--progress', '--log-level', 'INFO', '--no-update-modtime']
 
-  // Liste des fichiers connue depuis le diff → pas de re-scan
   let tmpFile = null
   if (Array.isArray(filesList) && filesList.length > 0) {
     tmpFile = path.join(os.tmpdir(), `bcm-files-${Date.now()}.txt`)
@@ -251,13 +279,12 @@ ipcMain.on('rclone:run', async (event, { src, dst, filesList }) => {
     args.push('--files-from', tmpFile, '--no-traverse')
   }
 
-  // On recharge le srcMap pour avoir les dates à jour lors des événements "done"
-  // (léger, uniquement les fichiers à copier grâce à --no-traverse)
   let srcMap = new Map()
   try {
     srcMap = await lsjson(rcloneBin, src)
   } catch { /* non bloquant, les dates seront "—" */ }
 
+  log.info(`run START src=${src} dst=${dst}`)
   event.reply('rclone:log', `$ ${rcloneBin} ${args.join(' ')}`)
 
   currentProc = spawn(rcloneBin, args)
@@ -272,12 +299,14 @@ ipcMain.on('rclone:run', async (event, { src, dst, filesList }) => {
   currentProc.stderr.on('data', handleData)
 
   currentProc.on('close', (code) => {
+    log.info(`run END code=${code ?? 1}`)
     currentProc = null
     if (tmpFile) try { fs.unlinkSync(tmpFile) } catch {}
     event.reply('rclone:done', { code: code ?? 1 })
   })
 
   currentProc.on('error', (err) => {
+    log.error(`run ERREUR: ${err.message}`)
     currentProc = null
     if (tmpFile) try { fs.unlinkSync(tmpFile) } catch {}
     event.reply('rclone:log', `[ERREUR] Impossible de lancer rclone : ${err.message}`)

@@ -1,7 +1,7 @@
 {
   "name": "backup-cloud-manager",
   "private": true,
-  "version": "1.0.0",
+  "version": "2.1.0",
   "type": "module",
   "main": "electron/main.js",
   "scripts": {
@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "dotenv": "^16.4.5",
+    "electron-log": "^5.4.3",
     "vue": "^3.5.30"
   },
   "devDependencies": {
@@ -38,7 +39,10 @@
       "electron/**/*"
     ],
     "extraResources": [
-      { "from": ".env", "to": ".env" }
+      {
+        "from": ".env",
+        "to": ".env"
+      }
     ],
     "directories": {
       "buildResources": "public",

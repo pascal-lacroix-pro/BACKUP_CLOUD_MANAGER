@@ -21,7 +21,7 @@
       </button>
     </div>
 
-    <!-- Local : champ texte + bouton Parcourir -->
+    <!-- Local : champ texte + bouton Parcourir + raccourci iCloud Drive -->
     <div v-if="modelValue.type === 'local'" class="flex gap-2">
       <input
         :value="modelValue.localPath"
@@ -114,4 +114,5 @@ async function browse() {
   const result = await window.rcloneAPI.browse()
   if (result) update({ localPath: result })
 }
+
 </script>

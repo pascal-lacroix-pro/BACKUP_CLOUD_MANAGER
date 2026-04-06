@@ -99,6 +99,7 @@
 
     </div>
   </div>
+
 </template>
 
 <script setup>
@@ -166,6 +167,7 @@ onMounted(async () => {
 
   unsubLog = window.rcloneAPI.onLog((line) => {
     logs.value.push(line);
+    if (logs.value.length > 2000) logs.value.splice(0, logs.value.length - 2000);
   });
 
   unsubFile = window.rcloneAPI.onFile(
@@ -249,6 +251,7 @@ async function handleApply() {
 function handleStop() {
   window.rcloneAPI.stop();
 }
+
 
 function clearLogs() {
   logs.value     = [];
