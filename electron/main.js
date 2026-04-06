@@ -101,13 +101,18 @@ function isValidRclonePath(p) {
 
 const LSJSON_MAX_BYTES = 50 * 1024 * 1024
 
-function lsjson(rcloneBin, rclonePath) {
+function lsjson(rcloneBin, rclonePath, { signal } = {}) {
   return new Promise((resolve, reject) => {
     const chunks = []
     let totalBytes = 0
     let aborted = false
 
     const proc = spawn(rcloneBin, ['lsjson', rclonePath, '--recursive', '--max-depth', '10'])
+    signal?.addEventListener('abort', () => {
+      aborted = true
+      killProc(proc)
+      reject(new Error('Opération annulée.'))
+    }, { once: true })
 
     proc.stdout.on('data', (d) => {
       totalBytes += d.length
@@ -166,6 +171,12 @@ let currentProc = null
 
 function killProc(proc) {
   if (!proc) return
+  // Objet léger { kill } utilisé pendant le diff (AbortController)
+  if (typeof proc.kill === 'function' && !proc.once) {
+    proc.kill()
+    return
+  }
+  // Vrai processus child_process → SIGTERM + SIGKILL fallback
   proc.kill('SIGTERM')
   const fallback = setTimeout(() => {
     try { proc.kill('SIGKILL') } catch {}
@@ -214,12 +225,19 @@ ipcMain.on('rclone:diff', async (event, { src, dst }) => {
   const rcloneBin = process.env.VITE_RCLONE_PATH || '/usr/local/bin/rclone'
   log.info(`diff START src=${src} dst=${dst}`)
 
+  const abort = new AbortController()
+  currentProc = { kill: () => abort.abort() }
+
   event.reply('rclone:log', `[INFO] Listing en parallèle…\n  src: ${src}\n  dst: ${dst}`)
 
   let srcMap, dstMap
   try {
-    ;[srcMap, dstMap] = await Promise.all([lsjson(rcloneBin, src), lsjson(rcloneBin, dst)])
+    ;[srcMap, dstMap] = await Promise.all([
+      lsjson(rcloneBin, src, { signal: abort.signal }),
+      lsjson(rcloneBin, dst, { signal: abort.signal }),
+    ])
   } catch (err) {
+    currentProc = null
     log.error(`diff ERREUR: ${err.message}`)
     event.reply('rclone:log', `[ERREUR] ${err.message}`)
     event.reply('rclone:done', { code: 1 })
@@ -243,8 +261,8 @@ ipcMain.on('rclone:diff', async (event, { src, dst }) => {
     }
   }
 
-  const msg = `diff END src=${srcMap.size} dst=${dstMap.size} missing=${missing}`
-  log.info(msg)
+  currentProc = null
+  log.info(`diff END src=${srcMap.size} dst=${dstMap.size} missing=${missing}`)
   event.reply('rclone:log', `[INFO] Diff terminé : ${srcMap.size} fichiers source, ${dstMap.size} destination, ${missing} à copier.`)
   event.reply('rclone:done', { code: 0 })
 })
