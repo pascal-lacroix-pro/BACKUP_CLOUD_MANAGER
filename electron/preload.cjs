@@ -2,12 +2,24 @@ const { contextBridge, ipcRenderer } = require('electron')
 
 contextBridge.exposeInMainWorld('rcloneAPI', {
 
-  run(subPath, direction, dryRun) {
-    ipcRenderer.send('rclone:run', { subPath, direction, dryRun })
+  diff(src, dst) {
+    ipcRenderer.send('rclone:diff', { src, dst })
+  },
+
+  run(src, dst, filesList) {
+    ipcRenderer.send('rclone:run', { src, dst, filesList })
   },
 
   stop() {
     ipcRenderer.send('rclone:stop')
+  },
+
+  listRemotes() {
+    return ipcRenderer.invoke('rclone:listremotes')
+  },
+
+  browse() {
+    return ipcRenderer.invoke('dialog:browse')
   },
 
   onLog(callback) {
